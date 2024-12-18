@@ -13,9 +13,5 @@ devenv.local.nix
 
 /target
 
-
-# Added by cargo
-#
-# already existing elements were commented out
-
-#/target
+# debug
+frame_*.png
