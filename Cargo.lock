@@ -1617,6 +1617,7 @@ dependencies = [
  "gstreamer-app",
  "gstreamer-video",
  "image",
+ "ort",
  "png",
  "tracing",
  "tracing-subscriber",

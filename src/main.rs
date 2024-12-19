@@ -6,20 +6,31 @@ use gstreamer as gst;
 use gstreamer::prelude::ElementExt;
 use gstreamer_app::AppSinkCallbacks;
 use gstreamer_video as gst_video;
-use image::{DynamicImage, ImageFormat, ImageReader, RgbImage};
+use image::{DynamicImage, ImageFormat, RgbImage};
+use ort::execution_providers::{CUDAExecutionProvider, CoreMLExecutionProvider};
 use std::fs::File;
 use std::{
     env,
     sync::atomic::{AtomicUsize, Ordering},
 };
 use yolo_rs::model::YoloModelSession;
-use yolo_rs::{BoundingBox, YoloInput, image_to_yolo_input_tensor, inference};
+use yolo_rs::{BoundingBox, image_to_yolo_input_tensor, inference};
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     // Initialize GStreamer
     gst::init()?;
+
+    // Initialize ONNX runtime
+    ort::init()
+        .with_execution_providers([
+            CUDAExecutionProvider::default().build(),
+            CoreMLExecutionProvider::default().build(),
+        ])
+        .with_telemetry(true)
+        .commit()
+        .expect("failed to initialize ONNX runtime");
 
     // Check for RTSP stream URI argument
     let args: Vec<String> = env::args().collect();
@@ -62,12 +73,12 @@ fn main() -> anyhow::Result<()> {
 
     let frame_counter = AtomicUsize::new(0);
 
-    let yolo_model = YoloModelSession::from_filename_v8("models/yolo11x.onnx")
-        .context("failed to load YOLO model")?;
-
     let (inferrence_queue_sender, inferrence_queue_receiver) = bounded::<(usize, DynamicImage)>(30);
 
-    let handle = std::thread::spawn(move || {
+    let inference_worker = std::thread::spawn(|| {
+        let yolo_model = YoloModelSession::from_filename_v8("models/yolo11x.onnx")
+            .expect("failed to load YOLO model");
+
         for (frame_id, frame) in inferrence_queue_receiver {
             tracing::info!("Inferring frame {}", frame_id);
             let now = std::time::Instant::now();
@@ -214,7 +225,7 @@ fn main() -> anyhow::Result<()> {
         .set_state(gst::State::Null)
         .context("failed to stop pipeline")?;
 
-    handle.join().expect("failed to join thread");
+    inference_worker.join().expect("failed to join thread");
 
     Ok(())
 }
