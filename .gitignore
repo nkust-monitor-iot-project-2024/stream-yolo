@@ -15,3 +15,4 @@ devenv.local.nix
 
 # debug
 frame_*.png
+models/

@@ -1,4 +1,5 @@
 use anyhow::Context;
+use crossbeam::channel::bounded;
 use glib::object::Cast;
 use gst::prelude::*;
 use gstreamer as gst;
@@ -61,10 +62,47 @@ fn main() -> anyhow::Result<()> {
 
     let frame_counter = AtomicUsize::new(0);
 
-    let yolo_model = YoloModelSession::from_filename_v8(
-        "/Volumes/Dev/nkust/iot/yolo-v11-rs/examples/yolo-cli/models/yolo11x.onnx",
-    )
-    .context("failed to load YOLO model")?;
+    let yolo_model = YoloModelSession::from_filename_v8("models/yolo11x.onnx")
+        .context("failed to load YOLO model")?;
+
+    let (inferrence_queue_sender, inferrence_queue_receiver) = bounded::<(usize, DynamicImage)>(30);
+
+    let handle = std::thread::spawn(move || {
+        for (frame_id, frame) in inferrence_queue_receiver {
+            tracing::info!("Inferring frame {}", frame_id);
+            let now = std::time::Instant::now();
+
+            let yolo_input = image_to_yolo_input_tensor(&frame);
+            let yolo_output =
+                inference(&yolo_model, yolo_input.view()).expect("failed to run inference");
+
+            tracing::info!(
+                "Found {} entities, elapsed: {:?}",
+                yolo_output.len(),
+                now.elapsed()
+            );
+
+            // extract the entity to few pictures
+            for entity in yolo_output {
+                let BoundingBox { x1, x2, y1, y2 } = entity.bounding_box;
+                let label = entity.label;
+                let confidence = entity.confidence;
+
+                let cropped_image =
+                    frame.crop_imm(x1 as _, y1 as _, (x2 - x1) as u32, (y2 - y1) as u32);
+
+                // save the image to "frame-<counter>-<label>-<confidence>.png"
+                let mut file = File::create(format!(
+                    "frame_{}_{}_{:.2}.png",
+                    frame_id, label, confidence
+                ))
+                .expect("expect a valid file");
+                cropped_image
+                    .write_to(&mut file, ImageFormat::Png)
+                    .expect("expect a valid image");
+            }
+        }
+    });
 
     let appsink_callback = AppSinkCallbacks::builder()
         .new_sample(move |sink| {
@@ -97,40 +135,9 @@ fn main() -> anyhow::Result<()> {
                     .expect("expect a valid image");
                 let dynamic_image = DynamicImage::ImageRgb8(frame);
 
-                tracing::info!("Inferring frame {}", counter);
-                let now = std::time::Instant::now();
-
-                let yolo_input = image_to_yolo_input_tensor(&dynamic_image);
-                let yolo_output =
-                    inference(&yolo_model, yolo_input.view()).expect("failed to run inference");
-
-                tracing::info!(
-                    "Found {} entities, elapsed: {:?}",
-                    yolo_output.len(),
-                    now.elapsed()
-                );
-
-                // extract the entity to few pictures
-                for entity in yolo_output {
-                    let BoundingBox { x1, x2, y1, y2 } = entity.bounding_box;
-                    let label = entity.label;
-                    let confidence = entity.confidence;
-
-                    let cropped_image = dynamic_image.crop_imm(
-                        x1 as _,
-                        y1 as _,
-                        (x2 - x1) as u32,
-                        (y2 - y1) as u32,
-                    );
-
-                    // save the image to "frame-<counter>-<label>-<confidence>.png"
-                    let mut file =
-                        File::create(format!("frame-{}-{}-{:.2}.png", counter, label, confidence))
-                            .expect("expect a valid file");
-                    cropped_image
-                        .write_to(&mut file, ImageFormat::Png)
-                        .expect("expect a valid image");
-                }
+                inferrence_queue_sender
+                    .send((counter, dynamic_image))
+                    .expect("failed to send frame to inferrence queue");
             }
 
             Ok(gst::FlowSuccess::Ok)
@@ -206,6 +213,8 @@ fn main() -> anyhow::Result<()> {
     pipeline
         .set_state(gst::State::Null)
         .context("failed to stop pipeline")?;
+
+    handle.join().expect("failed to join thread");
 
     Ok(())
 }
