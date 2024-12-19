@@ -5,11 +5,14 @@ use gstreamer as gst;
 use gstreamer::prelude::ElementExt;
 use gstreamer_app::AppSinkCallbacks;
 use gstreamer_video as gst_video;
+use image::{DynamicImage, ImageFormat, ImageReader, RgbImage};
 use std::fs::File;
 use std::{
     env,
     sync::atomic::{AtomicUsize, Ordering},
 };
+use yolo_rs::model::YoloModelSession;
+use yolo_rs::{BoundingBox, YoloInput, image_to_yolo_input_tensor, inference};
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
@@ -29,7 +32,6 @@ fn main() -> anyhow::Result<()> {
 
     let rtspsrc_element = gst::ElementFactory::make("rtspsrc")
         .property("location", rtsp_url)
-        .property("latency", 500_u32)
         .build()
         .context("failed to create rtspsrc element")?;
 
@@ -38,6 +40,8 @@ fn main() -> anyhow::Result<()> {
         .context("failed to create rtpjitterbuffer element")?;
 
     let rtph264depay_element = gst::ElementFactory::make("rtph264depay")
+        .property("wait-for-keyframe", true)
+        .property("request-keyframe", true)
         .build()
         .context("failed to create rtph264depay element")?;
 
@@ -56,6 +60,11 @@ fn main() -> anyhow::Result<()> {
         .context("failed to create identity element")?;
 
     let frame_counter = AtomicUsize::new(0);
+
+    let yolo_model = YoloModelSession::from_filename_v8(
+        "/Volumes/Dev/nkust/iot/yolo-v11-rs/examples/yolo-cli/models/yolo11x.onnx",
+    )
+    .context("failed to load YOLO model")?;
 
     let appsink_callback = AppSinkCallbacks::builder()
         .new_sample(move |sink| {
@@ -84,16 +93,44 @@ fn main() -> anyhow::Result<()> {
                 // Extract the frame data
                 let frame_data = map.as_slice();
 
-                // Save the frame as PNG
-                let file_name = format!("frame_{counter}.png");
-                let file = File::create(&file_name).unwrap();
-                let mut encoder = png::Encoder::new(file, width as u32, height as u32);
-                encoder.set_color(png::ColorType::Rgb);
-                encoder.set_depth(png::BitDepth::Eight);
-                let mut writer = encoder.write_header().unwrap();
-                writer.write_image_data(frame_data).unwrap();
+                let frame = RgbImage::from_raw(width as u32, height as u32, frame_data.to_vec())
+                    .expect("expect a valid image");
+                let dynamic_image = DynamicImage::ImageRgb8(frame);
 
-                tracing::info!("Saved frame to {}", file_name);
+                tracing::info!("Inferring frame {}", counter);
+                let now = std::time::Instant::now();
+
+                let yolo_input = image_to_yolo_input_tensor(&dynamic_image);
+                let yolo_output =
+                    inference(&yolo_model, yolo_input.view()).expect("failed to run inference");
+
+                tracing::info!(
+                    "Found {} entities, elapsed: {:?}",
+                    yolo_output.len(),
+                    now.elapsed()
+                );
+
+                // extract the entity to few pictures
+                for entity in yolo_output {
+                    let BoundingBox { x1, x2, y1, y2 } = entity.bounding_box;
+                    let label = entity.label;
+                    let confidence = entity.confidence;
+
+                    let cropped_image = dynamic_image.crop_imm(
+                        x1 as _,
+                        y1 as _,
+                        (x2 - x1) as u32,
+                        (y2 - y1) as u32,
+                    );
+
+                    // save the image to "frame-<counter>-<label>-<confidence>.png"
+                    let mut file =
+                        File::create(format!("frame-{}-{}-{:.2}.png", counter, label, confidence))
+                            .expect("expect a valid file");
+                    cropped_image
+                        .write_to(&mut file, ImageFormat::Png)
+                        .expect("expect a valid image");
+                }
             }
 
             Ok(gst::FlowSuccess::Ok)
